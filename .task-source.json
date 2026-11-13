@@ -1,0 +1,188 @@
+{
+  "task_source_schema_version": 1,
+  "cc_feedback_profile": "cc-feedback-2611",
+  "project_domain": "游戏、图形与多媒体",
+  "project_subdirection": "音视频处理",
+  "supported_task_types": [
+    "功能开发",
+    "Bugfix",
+    "代码重构",
+    "功能优化",
+    "依赖升级与迁移",
+    "质量保障",
+    "项目维护",
+    "技术讨论",
+    "问题排查与诊断",
+    "部署运维",
+    "泛Agent需求"
+  ],
+  "entities": [
+    {
+      "id": "media_asset",
+      "label": "媒体资产",
+      "relations": [
+        "rendition.uses.media_asset",
+        "provenance_edge.references.media_asset"
+      ],
+      "invariants": [
+        "资产创建后字节和描述不可变",
+        "内容长度与 SHA-256 必须匹配请求字节",
+        "只有通过 WAV 或 Y4M 探测的字节才能形成资产记录"
+      ]
+    },
+    {
+      "id": "rendition",
+      "label": "派生任务",
+      "relations": [
+        "rendition.produces.media_asset",
+        "provenance_edge.describes.rendition"
+      ],
+      "invariants": [
+        "终态不可再次转换",
+        "completed 必须同时拥有输出资产和唯一谱系边",
+        "failed 不得暴露输出资产"
+      ]
+    },
+    {
+      "id": "provenance_edge",
+      "label": "谱系边",
+      "relations": [
+        "provenance_edge.links.rendition",
+        "provenance_edge.links.media_asset"
+      ],
+      "invariants": [
+        "每个 completed 派生只有一条谱系边",
+        "父子资产标识与派生记录一致",
+        "配方摘要与派生记录一致"
+      ]
+    },
+    {
+      "id": "integrity_check",
+      "label": "完整性检查",
+      "relations": [
+        "integrity_check.reproduces.rendition"
+      ],
+      "invariants": [
+        "verified 必须同时匹配媒体描述和输出摘要",
+        "mismatch 必须保留可观察原因",
+        "检查结果写入后不可改写"
+      ]
+    }
+  ],
+  "state_machines": [
+    {
+      "subject": "rendition",
+      "states": [
+        "queued",
+        "running",
+        "completed",
+        "failed"
+      ],
+      "transitions": [
+        "queued->running",
+        "running->completed",
+        "running->failed"
+      ],
+      "invariants": [
+        "completed 和 failed 均为终态",
+        "completed 前必须提交输出资产与谱系边",
+        "失败不得留下引用不存在的输出资产"
+      ]
+    },
+    {
+      "subject": "integrity_check",
+      "states": [
+        "pending",
+        "verified",
+        "mismatch"
+      ],
+      "transitions": [
+        "pending->verified",
+        "pending->mismatch"
+      ],
+      "invariants": [
+        "verified 需要字节摘要和媒体描述同时一致",
+        "mismatch 需要稳定原因",
+        "终态不可改写"
+      ]
+    }
+  ],
+  "capability_families": [
+    {
+      "family": "媒体编解码与派生",
+      "occupied_by": [
+        "wav_pcm16_probe",
+        "y4m_c420_probe",
+        "audio_operations",
+        "video_operations"
+      ],
+      "available": false
+    },
+    {
+      "family": "版本化与审计",
+      "occupied_by": [
+        "plan_digest",
+        "provenance_edge",
+        "reproduction_check"
+      ],
+      "available": false
+    },
+    {
+      "family": "并发与锁",
+      "occupied_by": [
+        "repository_mutation_lock"
+      ],
+      "available": true
+    },
+    {
+      "family": "恢复与回滚",
+      "occupied_by": [],
+      "available": true
+    },
+    {
+      "family": "批量事务",
+      "occupied_by": [],
+      "available": true
+    }
+  ],
+  "extension_seams": [
+    {
+      "id": "media-inspector-resolver",
+      "anchor": "avprovenance/media/inspector.py probe resolver",
+      "entry": "POST /v1/assets",
+      "distinct_outcome": "可加入新的容器探测而不改变资产持久化和 HTTP 契约",
+      "mechanism": "strategy_resolution"
+    },
+    {
+      "id": "operation-plan-compiler",
+      "anchor": "avprovenance/renditions/plan.py operation validators",
+      "entry": "POST /v1/renditions",
+      "distinct_outcome": "可加入新的音视频操作并保持状态转换和谱系语义",
+      "mechanism": "validated_operation_pipeline"
+    },
+    {
+      "id": "integrity-comparison-policy",
+      "anchor": "avprovenance/renditions/verifier.py comparison",
+      "entry": "POST /v1/renditions/{rendition_id}/integrity-checks",
+      "distinct_outcome": "可扩展描述元数据容差或分段摘要而保留持久检查结果",
+      "mechanism": "deterministic_recompute"
+    }
+  ],
+  "tension_points": [
+    {
+      "workflow_id": "ingest-media-asset",
+      "description": "先写内容地址再提交资产元数据时，探测失败或状态提交失败会留下孤儿字节；先提交元数据又会暴露尚不可读的资产",
+      "observable_failure": "状态文件中出现无存储对象的资产，或存取目录出现无资产记录的媒体字节"
+    },
+    {
+      "workflow_id": "execute-rendition",
+      "description": "派生执行跨越 queued、running、completed，输出写入和谱系提交必须与状态推进保持一致",
+      "observable_failure": "任务显示 completed 但缺少谱系边或输出摘要，或失败任务仍产生可见派生资产"
+    },
+    {
+      "workflow_id": "verify-reproduction",
+      "description": "重放可证明字节一致，但任何输入替换、配方漂移或输出缺失都必须转为 mismatch 而不是静默通过",
+      "observable_failure": "不同摘要被标记 verified，或检查失败后未持久化 mismatch 原因"
+    }
+  ]
+}

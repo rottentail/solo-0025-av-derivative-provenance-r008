@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "name": "AV Derivative Provenance",
+  "project_shape": "backend",
+  "stack": {
+    "language": "python",
+    "runtime": "CPython 3.11+",
+    "external_dependencies": []
+  },
+  "modules": [
+    {
+      "id": "http_api",
+      "path": "avprovenance/http_api.py",
+      "responsibility": "Expose mediated HTTP/JSON endpoints and map domain errors to responses"
+    },
+    {
+      "id": "application",
+      "path": "avprovenance/application.py",
+      "responsibility": "Coordinate ingestion, rendition execution, and integrity checks"
+    },
+    {
+      "id": "validation",
+      "path": "avprovenance/validation.py",
+      "responsibility": "Enforce request budgets and operation parameter boundaries"
+    },
+    {
+      "id": "media",
+      "path": "avprovenance/media",
+      "responsibility": "Inspect and transform PCM WAV and planar Y4M media bytes"
+    },
+    {
+      "id": "renditions",
+      "path": "avprovenance/renditions",
+      "responsibility": "Normalize plans, execute derivations, and reproduce outputs"
+    },
+    {
+      "id": "storage",
+      "path": "avprovenance/storage",
+      "responsibility": "Persist atomic JSON state and content-addressed blobs"
+    }
+  ],
+  "complexity": {
+    "mechanisms": [
+      "state_transition",
+      "error_propagation",
+      "resource_lifecycle",
+      "atomic_persistence",
+      "concurrency"
+    ]
+  },
+  "workflows": [
+    {
+      "id": "ingest-media-asset",
+      "name": "Ingest media asset",
+      "entry": "POST /v1/assets",
+      "steps": [
+        "validate base64 request and byte budget",
+        "inspect WAV or Y4M media bytes",
+        "write a content-addressed blob",
+        "commit the immutable asset record"
+      ],
+      "success": "Returns the persisted asset with digest and media descriptor",
+      "failure": "Malformed or unsupported bytes return a stable 4xx error without an asset record",
+      "verification": "The workflow check posts WAV bytes and reads the asset through the public API",
+      "module_ids": [
+        "http_api",
+        "validation",
+        "application",
+        "media",
+        "storage"
+      ]
+    },
+    {
+      "id": "execute-rendition",
+      "name": "Execute rendition",
+      "entry": "POST /v1/renditions",
+      "steps": [
+        "compile and validate the operation plan",
+        "persist queued and running lifecycle states",
+        "apply media operations and inspect the result",
+        "save the output asset and provenance edge",
+        "commit completed status"
+      ],
+      "success": "Returns a completed rendition with output asset and transition history",
+      "failure": "Records failed status with a stable error code and emits no completed edge",
+      "verification": "The workflow check renders bounded WAV and Y4M derivatives through HTTP",
+      "module_ids": [
+        "http_api",
+        "validation",
+        "application",
+        "renditions",
+        "media",
+        "storage"
+      ]
+    },
+    {
+      "id": "verify-reproduction",
+      "name": "Verify reproduction",
+      "entry": "POST /v1/renditions/{rendition_id}/integrity-checks",
+      "steps": [
+        "load the completed rendition and provenance edge",
+        "reload parent bytes and replay the stored plan",
+        "compare output digest and descriptor",
+        "persist verified or mismatch result"
+      ],
+      "success": "Returns a verified check with equal expected and reproduced digests",
+      "failure": "A drifted or missing output creates a mismatch with a stable reason",
+      "verification": "The workflow check renders Y4M media, verifies reproduction, and inspects lineage",
+      "module_ids": [
+        "http_api",
+        "application",
+        "renditions",
+        "media",
+        "storage"
+      ]
+    }
+  ],
+  "constraints": {
+    "online_services_required": false,
+    "native_media_binaries_required": false,
+    "deterministic_media_bytes": true
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "language": "python",
+  "project_shape": "backend",
+  "source_extensions": [
+    ".py"
+  ],
+  "build_command": "python3 -m compileall -q avprovenance scripts",
+  "testing": "deferred",
+  "workflow_checks": [
+    {
+      "workflow_id": "ingest-media-asset",
+      "command": "python3 scripts/workflow_checks.py ingest-media-asset"
+    },
+    {
+      "workflow_id": "execute-rendition",
+      "command": "python3 scripts/workflow_checks.py execute-rendition"
+    },
+    {
+      "workflow_id": "verify-reproduction",
+      "command": "python3 scripts/workflow_checks.py verify-reproduction"
+    }
+  ]
+}
