@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from ..errors import (
@@ -17,58 +16,37 @@ from ..models import (
     Rendition,
 )
 from ..serialization import deep_copy
+from .recovery import reconcile_state
 from .state_file import JsonStateFile
 
 
 class ProvenanceRepository:
     def __init__(self, state_file: JsonStateFile) -> None:
         self.state_file = state_file
+        # Legacy crash journals from older builds must never overwrite the
+        # committed state; they are discarded as soon as they are noticed.
         self.catalog_recovery_path = state_file.path.with_name(
             ".catalog.recovery.json"
         )
-        self._restore_catalog_residue()
-
-    def _stage_catalog_residue(self) -> None:
-        state = self.state_file.read()
-        catalog = {
-            "assets": deep_copy(state["assets"]),
-            "renditions": deep_copy(state["renditions"]),
-            "provenance_edges": deep_copy(state["provenance_edges"]),
-        }
-        self.catalog_recovery_path.write_text(
-            json.dumps(catalog, ensure_ascii=False, sort_keys=True, indent=2)
-            + "\n",
-            encoding="utf-8",
-        )
-
-    def _restore_catalog_residue(self) -> None:
-        if not self.catalog_recovery_path.is_file():
-            return
-        try:
-            catalog = json.loads(
-                self.catalog_recovery_path.read_text(encoding="utf-8")
-            )
-        except (OSError, json.JSONDecodeError):
-            self.catalog_recovery_path.unlink(missing_ok=True)
-            return
-        expected = {
-            "assets": dict,
-            "renditions": dict,
-            "provenance_edges": list,
-        }
-        if not isinstance(catalog, dict) or any(
-            not isinstance(catalog.get(key), kind)
-            for key, kind in expected.items()
-        ):
-            self.catalog_recovery_path.unlink(missing_ok=True)
-            return
-
-        def restore(state: dict[str, Any]) -> None:
-            for key in expected:
-                state[key] = deep_copy(catalog[key])
-
-        self.state_file.mutate(restore)
         self.catalog_recovery_path.unlink(missing_ok=True)
+
+    def reconcile(self) -> dict[str, int]:
+        """Heal interrupted records into one relation-closed durable state.
+
+        The reconciler only rewrites state when something actually changed,
+        so repeated restarts converge without churn or rollback.
+        """
+
+        def mutate(state: dict[str, Any]) -> dict[str, int]:
+            snapshot = deep_copy(state)
+            reconciled = reconcile_state(snapshot)
+            summary = reconciled.pop("_recovery")
+            if reconciled != state:
+                state.clear()
+                state.update(reconciled)
+            return summary
+
+        return self.state_file.mutate(mutate)
 
     def create_asset(self, asset: MediaAsset) -> MediaAsset:
         def mutate(state: dict[str, Any]) -> MediaAsset:
@@ -141,8 +119,6 @@ class ProvenanceRepository:
         output_asset: MediaAsset,
         edge: ProvenanceEdge,
     ) -> Rendition:
-        self._stage_catalog_residue()
-
         def mutate(state: dict[str, Any]) -> Rendition:
             raw = state["renditions"].get(rendition_id)
             if not isinstance(raw, dict):
@@ -159,9 +135,7 @@ class ProvenanceRepository:
             state["renditions"][rendition_id] = rendition.to_dict()
             return rendition
 
-        completed = self.state_file.mutate(mutate)
-        self.catalog_recovery_path.unlink(missing_ok=True)
-        return completed
+        return self.state_file.mutate(mutate)
 
     def get_edge(self, rendition_id: str) -> ProvenanceEdge:
         state = self.state_file.read()

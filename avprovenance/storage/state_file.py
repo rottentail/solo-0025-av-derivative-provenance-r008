@@ -1,4 +1,22 @@
-"""Atomic JSON state file with serialized in-process mutations."""
+"""Atomic JSON state file with serialized in-process mutations.
+
+Durability model
+----------------
+
+Every mutation writes a pre-image journal (``.state.json.recovery``) before
+the committed ``state.json`` is replaced.  The journal is *only* consulted
+when no readable committed state exists:
+
+* A healthy ``state.json`` is always treated as the most recent durable
+  fact.  A journal left behind because the process was killed after the
+  atomic replacement but before journal removal is stale and discarded.
+* When ``state.json`` is missing or unreadable, a structurally valid
+  journal replaces it; otherwise the corrupt file is quarantined and the
+  service starts from an empty default state instead of failing to boot.
+
+Because ``os.replace`` is atomic, the committed state never contains a
+partially written document, and recovery is idempotent across restarts.
+"""
 
 from __future__ import annotations
 
@@ -28,40 +46,119 @@ class JsonStateFile:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.recovery_path = path.with_name(f".{path.name}.recovery")
+        self._staging_path = self.recovery_path.with_suffix(".tmp")
         self._lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
-            if not self.path.exists():
-                self._write_unlocked(deepcopy(DEFAULT_STATE))
-            self._restore_interrupted_write_unlocked()
+            self._staging_path.unlink(missing_ok=True)
+            self._remove_stale_siblings_unlocked()
+            self._recover_unlocked()
 
-    def _restore_interrupted_write_unlocked(self) -> None:
-        if not self.recovery_path.is_file():
+    def _remove_stale_siblings_unlocked(self) -> None:
+        """Discard temp files left by a process killed mid write."""
+        try:
+            siblings = self.path.parent.iterdir()
+        except OSError:
+            return
+        for sibling in siblings:
+            if not sibling.is_file():
+                continue
+            name = sibling.name
+            if (
+                name.startswith(".state-")
+                and name.endswith(".tmp")
+            ) or name == self._staging_path.name:
+                sibling.unlink(missing_ok=True)
+
+    @staticmethod
+    def _is_valid_state(value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        return all(key in value for key in DEFAULT_STATE)
+
+    def _fsync_directory_unlocked(self) -> None:
+        try:
+            descriptor = os.open(self.path.parent, os.O_RDONLY)
+        except OSError:
             return
         try:
-            candidate = json.loads(
-                self.recovery_path.read_text(encoding="utf-8")
-            )
-        except (OSError, json.JSONDecodeError):
+            os.fsync(descriptor)
+        except OSError:
+            pass
+        finally:
+            os.close(descriptor)
+
+    def _quarantine_unlocked(self, path: Path) -> None:
+        if not path.exists():
+            return
+        counter = 0
+        while True:
+            suffix = f".corrupt-{counter}" if counter else ".corrupt"
+            destination = path.with_name(path.name + suffix)
+            if not destination.exists():
+                try:
+                    os.replace(path, destination)
+                except OSError:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                return
+            counter += 1
+
+    def _read_json_file_unlocked(self, path: Path) -> Any:
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def _recover_unlocked(self) -> None:
+        """Establish one readable committed state without downgrading it."""
+        committed: Any = None
+        if self.path.is_file():
+            try:
+                committed = self._read_json_file_unlocked(self.path)
+            except (OSError, json.JSONDecodeError):
+                committed = None
+            if not self._is_valid_state(committed):
+                committed = None
+
+        if committed is not None:
+            # The committed state is the newest durable fact.  Any journal
+            # still present predates it and must not roll it back.
             self.recovery_path.unlink(missing_ok=True)
             return
-        if not isinstance(candidate, dict):
+
+        journal: Any = None
+        if self.recovery_path.is_file():
+            try:
+                journal = self._read_json_file_unlocked(self.recovery_path)
+            except (OSError, json.JSONDecodeError):
+                journal = None
+
+        if self._is_valid_state(journal):
+            self._write_unlocked(journal)
             self.recovery_path.unlink(missing_ok=True)
+            self._fsync_directory_unlocked()
             return
-        self._write_unlocked(candidate)
-        self.recovery_path.unlink(missing_ok=True)
+
+        # Neither document can serve as state.  Quarantine the damage and
+        # keep the service available with an empty catalog.
+        if self.path.is_file():
+            self._quarantine_unlocked(self.path)
+        if self.recovery_path.is_file():
+            self._quarantine_unlocked(self.recovery_path)
+        self._write_unlocked(deepcopy(DEFAULT_STATE))
+        self._fsync_directory_unlocked()
 
     def _stage_interrupted_write_unlocked(self, value: dict[str, Any]) -> None:
-        temporary = self.recovery_path.with_suffix(".tmp")
         try:
-            with temporary.open("w", encoding="utf-8") as handle:
+            with self._staging_path.open("w", encoding="utf-8") as handle:
                 json.dump(value, handle, ensure_ascii=False, sort_keys=True, indent=2)
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, self.recovery_path)
+            os.replace(self._staging_path, self.recovery_path)
+            self._fsync_directory_unlocked()
         except OSError as exc:
-            temporary.unlink(missing_ok=True)
+            self._staging_path.unlink(missing_ok=True)
             raise PersistenceFailure(
                 "The state recovery record could not be saved."
             ) from exc
@@ -101,6 +198,7 @@ class JsonStateFile:
             os.fsync(temporary.fileno())
             temporary.close()
             os.replace(temporary_path, self.path)
+            self._fsync_directory_unlocked()
         except OSError as exc:
             temporary.close()
             try:
@@ -120,4 +218,5 @@ class JsonStateFile:
             result = mutation(state)
             self._write_unlocked(state)
             self.recovery_path.unlink(missing_ok=True)
+            self._fsync_directory_unlocked()
             return result

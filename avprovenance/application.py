@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -49,41 +48,27 @@ class MediaProvenanceApplication:
         self.content_files = ContentFileRepository(self.data_dir / "content")
         self.state_file = JsonStateFile(self.data_dir / "state.json")
         self.repository = ProvenanceRepository(self.state_file)
+        # Legacy crash journals from older builds are never authoritative;
+        # discard them so they cannot roll back or delete committed facts.
         self.content_recovery_path = self.data_dir / ".content.recovery.json"
-        self._restore_content_residue()
-
-    def _stage_content_residue(self) -> None:
-        state = self.state_file.read()
-        keys = sorted(
-            str(raw["content_key"])
-            for raw in state["assets"].values()
-            if isinstance(raw, dict) and raw.get("content_key")
-        )
-        self.content_recovery_path.write_text(
-            json.dumps({"content_keys": keys}, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-
-    def _restore_content_residue(self) -> None:
-        if not self.content_recovery_path.is_file():
-            return
-        try:
-            value = json.loads(
-                self.content_recovery_path.read_text(encoding="utf-8")
-            )
-            preserved = set(value["content_keys"])
-        except (OSError, json.JSONDecodeError, KeyError, TypeError):
-            self.content_recovery_path.unlink(missing_ok=True)
-            return
-
-        root = self.content_files.root.resolve()
-        for path in root.rglob("*"):
-            if not path.is_file() or path.name.startswith(".content-"):
-                continue
-            key = path.resolve().relative_to(root).as_posix()
-            if key not in preserved:
-                path.unlink(missing_ok=True)
         self.content_recovery_path.unlink(missing_ok=True)
+        self._recover_interrupted_work()
+
+    def _recover_interrupted_work(self) -> None:
+        """Reconcile catalog relations, then garbage-collect orphan bytes.
+
+        Ordering matters: state is healed first so that every content key
+        still referenced by a surviving asset is known before any media
+        byte is removed.  The whole routine is idempotent and therefore
+        safe across repeated restarts.
+        """
+        self.repository.reconcile()
+        referenced_keys = [
+            str(raw["content_key"])
+            for raw in self.state_file.read()["assets"].values()
+            if isinstance(raw, dict) and raw.get("content_key")
+        ]
+        self.content_files.garbage_collect(referenced_keys)
 
     def _asset_bytes(self, asset: MediaAsset) -> bytes:
         return self.content_files.read(asset.content_key)
@@ -199,7 +184,6 @@ class MediaProvenanceApplication:
             output_digest = sha256_hex(outcome.data)
             output_key = self.content_files.key_for_digest(output_digest)
             output_existed = self.content_files.exists(output_key)
-            self._stage_content_residue()
             self.content_files.write(outcome.data, output_digest)
             output_asset = MediaAsset(
                 id=new_identifier("asset"),
@@ -230,7 +214,6 @@ class MediaProvenanceApplication:
                     output_asset,
                     edge,
                 )
-                self.content_recovery_path.unlink(missing_ok=True)
             except Exception:
                 if not output_existed:
                     self.content_files.remove(output_key)
